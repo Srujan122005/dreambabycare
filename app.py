@@ -1,0 +1,1806 @@
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash
+from functools import wraps
+import sqlite3
+from datetime import datetime, timedelta
+import os
+import json
+from translations import translations
+import smtplib
+from email.message import EmailMessage
+from urllib.parse import quote
+
+app = Flask(__name__)
+app.secret_key = 'your_secret_key_here'  # Change this in production
+# Admin credentials (change in production or use env vars)
+app.config['ADMIN_USER'] = 'admin'
+app.config['ADMIN_PASS'] = 'admin123'
+
+# Jinja filter to format numbers as Indian Rupees
+def format_inr(value):
+    try:
+        val = float(value)
+    except Exception:
+        return value
+    return f"\u20B9{val:,.2f}"
+
+app.jinja_env.filters['inr'] = format_inr
+
+# Helper decorator to require login for certain routes
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# Helper decorator to require doctor login
+def doctor_required(f):
+    @wraps(f)
+    def decorated_doctor(*args, **kwargs):
+        if 'doctor_id' not in session:
+            return redirect(url_for('doctor_login'))
+        return f(*args, **kwargs)
+    return decorated_doctor
+
+
+# Helper decorator to require admin login for admin routes
+def admin_required(f):
+    @wraps(f)
+    def decorated_admin(*args, **kwargs):
+        # Allow access if logged in via admin panel OR the logged-in user has is_admin flag in DB
+        if session.get('admin_logged_in'):
+            return f(*args, **kwargs)
+
+        user_email = session.get('user_id')
+        if user_email:
+            try:
+                conn = sqlite3.connect('babycare.db')
+                c = conn.cursor()
+                # Check if is_admin column exists
+                c.execute("PRAGMA table_info('users')")
+                cols = [r[1] for r in c.fetchall()]
+                if 'is_admin' in cols:
+                    c.execute("SELECT is_admin FROM users WHERE email = ?", (user_email,))
+                    row = c.fetchone()
+                    if row and int(row[0]) == 1:
+                        conn.close()
+                        return f(*args, **kwargs)
+                conn.close()
+            except Exception:
+                pass
+
+        return redirect(url_for('admin_login'))
+    return decorated_admin
+
+# Initialize database
+def init_db():
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    
+    # Contacts table
+    c.execute('''CREATE TABLE IF NOT EXISTS contacts
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL,
+                 email TEXT NOT NULL,
+                 message TEXT NOT NULL,
+                 date TEXT NOT NULL)''')
+    
+    # Users table (for user accounts)
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 email TEXT UNIQUE NOT NULL,
+                 password TEXT NOT NULL,
+                 parent_name TEXT NOT NULL,
+                 baby_name TEXT NOT NULL,
+                 baby_dob TEXT NOT NULL,
+                 baby_age TEXT,
+                 phone TEXT,
+                 address TEXT,
+                 created_at TEXT NOT NULL)''')
+
+    # Ensure is_admin column exists on users table (safe migration)
+    try:
+        c.execute("PRAGMA table_info('users')")
+        cols = [r[1] for r in c.fetchall()]
+        if 'is_admin' not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+        if 'language' not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'")
+        if 'is_subscribed' not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN is_subscribed INTEGER DEFAULT 0")
+        if 'subscription_pending' not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN subscription_pending INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    # Ensure contacts table has columns for admin replies
+    try:
+        c.execute("PRAGMA table_info('contacts')")
+        contact_cols = [r[1] for r in c.fetchall()]
+        if 'admin_reply' not in contact_cols:
+            c.execute("ALTER TABLE contacts ADD COLUMN admin_reply TEXT")
+        if 'replied_at' not in contact_cols:
+            c.execute("ALTER TABLE contacts ADD COLUMN replied_at TEXT")
+        if 'replied_by' not in contact_cols:
+            c.execute("ALTER TABLE contacts ADD COLUMN replied_by TEXT")
+    except Exception:
+        pass
+    
+    # Products table
+    c.execute('''CREATE TABLE IF NOT EXISTS products
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL,
+                 description TEXT NOT NULL,
+                 price REAL NOT NULL,
+                 image TEXT NOT NULL,
+                 category TEXT NOT NULL)''')
+    
+    # Cart table (simplified for demo)
+    c.execute('''CREATE TABLE IF NOT EXISTS cart
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 product_id INTEGER NOT NULL,
+                 quantity INTEGER NOT NULL,
+                 session_id TEXT NOT NULL)''')
+    
+    # Baby Tracker table (for feeding, diaper, sleep tracking)
+    c.execute('''CREATE TABLE IF NOT EXISTS baby_tracker
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id TEXT NOT NULL,
+                 activity_type TEXT NOT NULL,
+                 start_time TEXT NOT NULL,
+                 end_time TEXT,
+                 notes TEXT,
+                 created_at TEXT NOT NULL,
+                 FOREIGN KEY(user_id) REFERENCES users(email))''')
+    
+    # Reminders table
+    c.execute('''CREATE TABLE IF NOT EXISTS reminders
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id TEXT NOT NULL,
+                 message TEXT NOT NULL,
+                 remind_time TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 FOREIGN KEY(user_id) REFERENCES users(email))''')
+
+    # Doctors table
+    c.execute('''CREATE TABLE IF NOT EXISTS doctors
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL,
+                 specialization TEXT NOT NULL,
+                 email TEXT UNIQUE NOT NULL,
+                 password TEXT NOT NULL,
+                 image TEXT,
+                 phone TEXT,
+                 video_link TEXT,
+                 is_available INTEGER DEFAULT 1)''')
+
+    # Appointments table
+    c.execute('''CREATE TABLE IF NOT EXISTS appointments
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id TEXT NOT NULL,
+                 doctor_id INTEGER NOT NULL,
+                 appointment_time TEXT NOT NULL,
+                 type TEXT NOT NULL,
+                 status TEXT DEFAULT 'Pending',
+                 created_at TEXT NOT NULL,
+                 FOREIGN KEY(user_id) REFERENCES users(email),
+                 FOREIGN KEY(doctor_id) REFERENCES doctors(id))''')
+
+    # Insert sample products if they don't exist
+    sample_products = [
+        ('Diapers - Newborn Size', 'Soft, absorbent diapers for newborns (30 count)', 350.00, 'https://images.unsplash.com/photo-1519689680058-324335c77eba?auto=format&fit=crop&w=500', 'Diapering'),
+        ('Baby Wipes', 'Gentle, hypoallergenic wipes for sensitive skin (80 count)', 150.00, 'https://images.unsplash.com/photo-1556228720-19875c4b84b2?auto=format&fit=crop&w=500', 'Diapering'),
+        ('Baby Bottles Set', 'BPA-free bottles with anti-colic system (3 pack)', 450.00, 'https://images.unsplash.com/photo-1595347097560-69238724e7bd?auto=format&fit=crop&w=500', 'Feeding'),
+        ('Baby Formula', 'Nutritious formula for newborns (400g)', 650.00, 'https://images.unsplash.com/photo-1632053009503-2b28537e3824?auto=format&fit=crop&w=500', 'Feeding'),
+        ('Onesies - 5 Pack', 'Soft cotton onesies in assorted colors (Newborn size)', 999.00, 'https://images.unsplash.com/photo-1522771753035-0a15395031b2?auto=format&fit=crop&w=500', 'Clothing'),
+        ('Baby Blanket', 'Soft, warm blanket for swaddling and comfort', 550.00, 'https://images.unsplash.com/photo-1513159446162-54eb8bdaa79b?auto=format&fit=crop&w=500', 'Bedding'),
+        ('Baby Shampoo & Body Wash', 'Tear-free, gentle cleanser for baby', 250.00, 'https://images.unsplash.com/photo-1556228578-0d85b1a4d571?auto=format&fit=crop&w=500', 'Bathing'),
+        ('Baby Lotion', 'Moisturizing lotion for delicate skin', 220.00, 'https://images.unsplash.com/photo-1608248597279-f99d160bfbc8?auto=format&fit=crop&w=500', 'Bathing'),
+        ('Pacifiers - 2 Pack', 'Orthodontic pacifiers for newborns', 200.00, 'https://images.unsplash.com/photo-1596464716127-f9a0859d0437?auto=format&fit=crop&w=500', 'Comfort'),
+        ('Baby Thermometer', 'Digital thermometer for accurate temperature reading', 300.00, 'https://images.unsplash.com/photo-1584634731339-252c581abfc5?auto=format&fit=crop&w=500', 'Health'),
+    ]
+    
+    # Check if products already exist
+    c.execute("SELECT COUNT(*) FROM products")
+    if c.fetchone()[0] == 0:
+        c.executemany("INSERT INTO products (name, description, price, image, category) VALUES (?, ?, ?, ?, ?)", 
+                     sample_products)
+    else:
+        # Update existing products to use URLs if they are using old filenames
+        updates = {
+            'diapers.jpg': 'https://images.unsplash.com/photo-1519689680058-324335c77eba?auto=format&fit=crop&w=500',
+            'wipes.jpg': 'https://images.unsplash.com/photo-1556228720-19875c4b84b2?auto=format&fit=crop&w=500',
+            'bottles.jpg': 'https://images.unsplash.com/photo-1595347097560-69238724e7bd?auto=format&fit=crop&w=500',
+            'formula.jpg': 'https://images.unsplash.com/photo-1632053009503-2b28537e3824?auto=format&fit=crop&w=500',
+            'onesies.jpg': 'https://images.unsplash.com/photo-1522771753035-0a15395031b2?auto=format&fit=crop&w=500',
+            'blanket.jpg': 'https://images.unsplash.com/photo-1513159446162-54eb8bdaa79b?auto=format&fit=crop&w=500',
+            'shampoo.jpg': 'https://images.unsplash.com/photo-1556228578-0d85b1a4d571?auto=format&fit=crop&w=500',
+            'lotion.jpg': 'https://images.unsplash.com/photo-1608248597279-f99d160bfbc8?auto=format&fit=crop&w=500',
+            'pacifiers.jpg': 'https://images.unsplash.com/photo-1596464716127-f9a0859d0437?auto=format&fit=crop&w=500',
+            'thermometer.jpg': 'https://images.unsplash.com/photo-1584634731339-252c581abfc5?auto=format&fit=crop&w=500'
+        }
+        for old, new in updates.items():
+            c.execute("UPDATE products SET image = ? WHERE image = ?", (new, old))
+    
+    # Insert sample doctors if none exist
+    c.execute("SELECT COUNT(*) FROM doctors")
+    if c.fetchone()[0] == 0:
+        sample_doctors = [
+            ('Dr. Sarah Smith', 'Pediatrician', 'sarah.smith@clinic.com', 'doc123', 'https://images.unsplash.com/photo-1559839734-2b71ea197ec2?auto=format&fit=crop&w=500', '+1234567890', 'https://meet.google.com/abc-defg-hij'),
+            ('Dr. John Doe', 'Child Psychologist', 'john.doe@clinic.com', 'doc123', 'https://images.unsplash.com/photo-1612349317150-e413f6a5b16d?auto=format&fit=crop&w=500', '+1987654321', 'https://meet.google.com/xyz-uvwx-yz')
+        ]
+        c.executemany("INSERT INTO doctors (name, specialization, email, password, image, phone, video_link) VALUES (?, ?, ?, ?, ?, ?, ?)", sample_doctors)
+
+    # Ensure doctors table has email and password columns (migration for existing DB)
+    try:
+        c.execute("PRAGMA table_info('doctors')")
+        cols = [r[1] for r in c.fetchall()]
+        if 'email' not in cols:
+            c.execute("ALTER TABLE doctors ADD COLUMN email TEXT")
+            c.execute("UPDATE doctors SET email = replace(lower(name), ' ', '.') || '@clinic.com' WHERE email IS NULL")
+        if 'password' not in cols:
+            c.execute("ALTER TABLE doctors ADD COLUMN password TEXT DEFAULT 'doc123'")
+        
+        # Ensure appointments table has notes column
+        c.execute("PRAGMA table_info('appointments')")
+        appt_cols = [r[1] for r in c.fetchall()]
+        if 'notes' not in appt_cols:
+            c.execute("ALTER TABLE appointments ADD COLUMN notes TEXT")
+    except Exception:
+        pass
+
+    # Newsletter Subscribers table
+    c.execute('''CREATE TABLE IF NOT EXISTS newsletter_subscribers
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 email TEXT UNIQUE NOT NULL,
+                 subscribed_at TEXT NOT NULL)''')
+
+    # Ensure products table has sale_price column
+    try:
+        c.execute("PRAGMA table_info('products')")
+        prod_cols = [r[1] for r in c.fetchall()]
+        if 'sale_price' not in prod_cols:
+            c.execute("ALTER TABLE products ADD COLUMN sale_price REAL")
+            # Set some sale prices for demo (approx 15% off for some items)
+            c.execute("UPDATE products SET sale_price = price * 0.85 WHERE id IN (1, 3, 5, 7, 9)")
+    except Exception:
+        pass
+
+    conn.commit()
+    conn.close()
+
+# Ensure session_id exists for cart operations
+@app.before_request
+def ensure_session_id():
+    if 'session_id' not in session:
+        session['session_id'] = os.urandom(16).hex()
+    # Also load user language if logged in (existing logic moved here/kept)
+    if 'user_id' in session and 'language' not in session:
+        load_user_language()
+
+# Global language loader (kept as is, but ensure_session_id runs first)
+# @app.before_request
+# def load_user_language(): ... (Merged logic above to avoid multiple before_request conflicts if any)
+
+# Global language loader
+@app.before_request
+def load_user_language():
+    if 'user_id' in session:
+        try:
+            conn = sqlite3.connect('babycare.db')
+            c = conn.cursor()
+            c.execute("SELECT language FROM users WHERE email = ?", (session['user_id'],))
+            result = c.fetchone()
+            conn.close()
+            if result and result[0]:
+                session['language'] = result[0]
+        except Exception:
+            pass
+
+@app.context_processor
+def inject_language():
+    lang = session.get('language', 'en')
+    if lang not in translations:
+        lang = 'en'
+    
+    # Inject cart count
+    cart_count = 0
+    if 'session_id' in session:
+        conn = None
+        try:
+            conn = sqlite3.connect('babycare.db')
+            c = conn.cursor()
+            c.execute("SELECT SUM(quantity) FROM cart WHERE session_id = ?", (session['session_id'],))
+            res = c.fetchone()
+            if res and res[0]:
+                cart_count = res[0]
+        except:
+            pass
+        finally:
+            if conn:
+                conn.close()
+
+    # Inject logo URL globally (ensure you have a file at static/images/Dream_Baby_Care_Logo (1).jpg)
+    logo = url_for('static', filename='images/Dream_Baby_Care_Logo (1).jpg')
+
+    return dict(lang=lang, lang_data=translations.get(lang, {}), cart_count=cart_count, logo=logo)
+
+# Admin actions logging helpers
+def get_client_ip():
+    """Extract client IP from request, accounting for proxies."""
+    if request.headers.get('X-Forwarded-For'):
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+
+def log_admin_action(action, user_id, user_email, prev_is_sub, prev_pending, new_is_sub, new_pending):
+    """Log admin action with IP, admin user, and full state change info."""
+    entry = {
+        'timestamp': datetime.now().isoformat(),
+        'action': action,
+        'user_id': user_id,
+        'user_email': user_email,
+        'prev_is_subscribed': int(prev_is_sub),
+        'prev_subscription_pending': int(prev_pending),
+        'new_is_subscribed': int(new_is_sub),
+        'new_subscription_pending': int(new_pending),
+        'admin': session.get('admin_user') or session.get('user_id') or 'unknown',
+        'ip': get_client_ip()
+    }
+    try:
+        with open('admin_actions.log', 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def read_all_admin_actions():
+    """Read all admin actions from log and return as list with log_index for per-entry undo."""
+    if not os.path.exists('admin_actions.log'):
+        return []
+    try:
+        with open('admin_actions.log', 'r', encoding='utf-8') as f:
+            lines = [l.strip() for l in f.readlines() if l.strip()]
+            actions = []
+            for i, line in enumerate(lines):
+                try:
+                    entry = json.loads(line)
+                    entry['log_index'] = i  # Store position for undo reference
+                    actions.append(entry)
+                except Exception:
+                    pass
+            return actions
+    except Exception:
+        return []
+
+
+def read_last_admin_action():
+    """Read the last admin action from log (for legacy undo)."""
+    actions = read_all_admin_actions()
+    return actions[-1] if actions else None
+
+
+# Helper: send notification email to admin when a user requests subscription
+def send_admin_notification(subject, body):
+    # Requires SMTP settings in app.config: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_USE_TLS (optional), ADMIN_NOTIFICATION_EMAIL
+    host = app.config.get('SMTP_HOST')
+    admin_email = app.config.get('ADMIN_NOTIFICATION_EMAIL')
+    if not host or not admin_email:
+        return False
+    try:
+        port = app.config.get('SMTP_PORT', 587)
+        user = app.config.get('SMTP_USER')
+        passwd = app.config.get('SMTP_PASS')
+        use_tls = app.config.get('SMTP_USE_TLS', True)
+
+        msg = EmailMessage()
+        msg['Subject'] = subject
+        msg['From'] = user if user else admin_email
+        msg['To'] = admin_email
+        msg.set_content(body)
+
+        if use_tls:
+            server = smtplib.SMTP(host, port, timeout=10)
+            server.starttls()
+        else:
+            server = smtplib.SMTP(host, port, timeout=10)
+
+        if user and passwd:
+            server.login(user, passwd)
+
+        server.send_message(msg)
+        server.quit()
+        return True
+    except Exception:
+        return False
+
+# Home page
+@app.route('/')
+def landing():
+    if 'user_id' in session:
+        return redirect(url_for('home'))
+    return render_template('landing.html')
+
+@app.route('/home')
+@login_required
+def home():
+    return render_template('index.html', hero_image="https://images.unsplash.com/photo-1555252333-9f8e92e65df4?auto=format&fit=crop&w=1000")
+
+# About page
+@app.route('/about')
+@login_required
+def about():
+    about_info = {
+        'title': 'About Dream Baby Care',
+        'description': 'Dream Baby Care is your trusted companion in the beautiful journey of parenthood. We provide smart tracking tools, expert tips, and a curated shop to make your life easier and your baby happier.',
+        'mission': 'To empower every parent with the technology, knowledge, and support they need to raise happy, healthy babies.',
+        'features': [
+            {'icon': 'fas fa-baby-carriage', 'title': 'Smart Tracking', 'desc': 'Effortlessly track sleep, feeding, diaper changes, and health metrics.'},
+            {'icon': 'fas fa-shopping-bag', 'title': 'Curated Shop', 'desc': 'Access high-quality, safe, and essential products for your newborn.'},
+            {'icon': 'fas fa-lightbulb', 'title': 'Expert Guidance', 'desc': 'Get reliable tips on health, hygiene, soothing, and more.'},
+            {'icon': 'fas fa-shield-alt', 'title': 'Secure & Private', 'desc': 'Your family data is kept safe and private.'}
+        ],
+        'values': [
+            {'title': 'Compassion', 'desc': 'We care deeply about the well-being of every family.'},
+            {'title': 'Integrity', 'desc': 'We provide honest, evidence-based information.'},
+            {'title': 'Community', 'desc': 'We are building a supportive community for parents.'}
+        ]
+    }
+    return render_template('about.html', info=about_info)
+
+# Set language preference
+@app.route('/set_language/<lang>')
+def set_language(lang):
+    if lang in translations:
+        session['language'] = lang
+        # Update user's language preference in database if logged in
+        if 'user_id' in session:
+            try:
+                conn = sqlite3.connect('babycare.db')
+                c = conn.cursor()
+                c.execute("UPDATE users SET language = ? WHERE email = ?", (lang, session['user_id']))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+    return redirect(request.referrer or url_for('home'))
+
+# Tips page
+@app.route('/tips')
+@login_required
+def tips():
+    # Get user's language preference from database (or session fallback)
+    lang = session.get('language', 'en')
+    
+    if lang not in translations:
+        lang = 'en'
+    
+    # Get translations for current language
+    lang_data = translations[lang]
+    
+    # Tip categories mapping to translation keys
+    tip_keys = ['feeding', 'diapering', 'sleep', 'bathing', 'crying']
+    tips_content = {}
+    for key in tip_keys:
+        if key in lang_data['tips']:
+            tips_content[key] = lang_data['tips'][key]
+    
+    # Look for videos in static/videos/<slug>/
+    videos_by_category = {}
+    categories = ['Feeding', 'Diapering', 'Health', 'Bathing', 'Soothing']
+    for cat in categories:
+        slug = cat.lower().replace(' ', '_')
+        folder = os.path.join(app.root_path, 'static', 'videos', slug)
+        video_list = []
+        if os.path.isdir(folder):
+            for fname in sorted(os.listdir(folder)):
+                if fname.lower().endswith(('.mp4', '.webm', '.ogg')):
+                    url = url_for('static', filename=f'videos/{slug}/{fname}')
+                    video_list.append({'filename': fname, 'url': url})
+        videos_by_category[cat] = video_list
+
+    # Determine subscription state from session (keeps template simple)
+    is_sub = session.get('is_subscribed', 0)
+    sub_pending = session.get('subscription_pending', 0)
+
+    return render_template('tips.html', 
+                         lang=lang,
+                         lang_data=lang_data,
+                         tips_content=tips_content,
+                         categories=categories,
+                         videos_by_category=videos_by_category,
+                         is_subscribed=is_sub,
+                         subscription_pending=sub_pending)
+
+# Shop page
+@app.route('/shop')
+@login_required
+def shop():
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM products")
+    products = c.fetchall()
+    conn.close()
+    
+    # Group products by category
+    categories = {}
+    for product in products:
+        # Convert tuple to list to make it mutable
+        product_list = list(product)
+        # Prepend the static path to the image filename
+        if product_list[4].startswith('http'):
+            product_list[4] = product_list[4]
+        else:
+            product_list[4] = url_for('static', filename=f'images/{product[4]}')
+        category = product[5]  # category is at index 5
+        if category not in categories:
+            categories[category] = []
+        categories[category].append(product_list)
+    
+    return render_template('shop.html', categories=categories)
+
+# Product detail page
+@app.route('/product/<int:product_id>')
+def product_detail(product_id):
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+    product = c.fetchone()
+    conn.close()
+    
+    if product:
+        # Convert tuple to list to make it mutable
+        product_list = list(product)
+        # Prepend the static path to the image filename
+        if product_list[4].startswith('http'):
+            product_list[4] = product_list[4]
+        else:
+            product_list[4] = url_for('static', filename=f'images/{product[4]}')
+        return render_template('product_detail.html', product=product_list)
+    else:
+        return "Product not found", 404
+
+# Add to cart functionality
+@app.route('/add_to_cart/<int:product_id>')
+def add_to_cart(product_id):
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+    product = c.fetchone()
+    
+    if product:
+        conn.close()
+        # Redirect to Blinkit search page for the product
+        return redirect(f"https://blinkit.com/s/?q={quote(product[1])}")
+    
+    conn.close()
+    return redirect(url_for('shop'))
+
+@app.route('/remove_from_cart/<int:product_id>')
+def remove_from_cart(product_id):
+    if 'session_id' in session:
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM cart WHERE product_id = ? AND session_id = ?", (product_id, session['session_id']))
+        conn.commit()
+        conn.close()
+        flash('Item removed from cart', 'info')
+    return redirect(url_for('cart'))
+
+@app.route('/checkout')
+@login_required
+def checkout():
+    if 'session_id' in session:
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        # In a real app, you would create an order record here
+        c.execute("DELETE FROM cart WHERE session_id = ?", (session['session_id'],))
+        conn.commit()
+        conn.close()
+        flash('Order placed successfully! Thank you for shopping.', 'success')
+    return redirect(url_for('shop'))
+
+# View cart
+@app.route('/cart')
+def cart():
+    if 'session_id' not in session:
+        return render_template('cart.html', cart_items=[], total=0)
+    
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute('''SELECT products.id, products.name, products.price, products.image, cart.quantity 
+                 FROM cart 
+                 JOIN products ON cart.product_id = products.id 
+                 WHERE cart.session_id = ?''', (session['session_id'],))
+    cart_items_raw = c.fetchall()
+    cart_items = []
+    for item in cart_items_raw:
+        item_list = list(item)
+        # Prepend static path to image
+        if item_list[3].startswith('http'):
+            item_list[3] = item_list[3]
+        else:
+            item_list[3] = url_for('static', filename=f'images/{item[3]}')
+        cart_items.append(item_list)
+    
+    total = sum(item[2] * item[4] for item in cart_items)  # price * quantity
+    
+    conn.close()
+    return render_template('cart.html', cart_items=cart_items, total=total)
+
+# Contact page
+@app.route('/contact', methods=['GET', 'POST'])
+@login_required
+def contact():
+    # Require subscription to contact
+    if not session.get('is_subscribed'):
+        return redirect(url_for('subscribe'))
+
+    if request.method == 'POST':
+        name = request.form['name']
+        email = request.form['email']
+        message = request.form['message']
+        date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Save to database
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        c.execute("INSERT INTO contacts (name, email, message, date) VALUES (?, ?, ?, ?)",
+                  (name, email, message, date))
+        conn.commit()
+        conn.close()
+        
+        return redirect(url_for('contact_success'))
+
+    # Fetch doctors for appointment/call section
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM doctors")
+    doctors = c.fetchall()
+    conn.close()
+
+    return render_template('contact.html', doctors=doctors)
+
+@app.route('/book_appointment', methods=['POST'])
+@login_required
+def book_appointment():
+    doctor_id = request.form.get('doctor_id')
+    appt_time = request.form.get('appointment_time')
+    appt_type = request.form.get('type') # video or voice
+    
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO appointments (user_id, doctor_id, appointment_time, type, created_at) VALUES (?, ?, ?, ?, ?)",
+              (session['user_id'], doctor_id, appt_time, appt_type, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+    
+    flash('Appointment request sent successfully!', 'success')
+    return redirect(url_for('contact'))
+
+# Contact success page
+@app.route('/contact_success')
+def contact_success():
+    return render_template('contact_success.html')
+
+@app.route('/subscribe_newsletter', methods=['POST'])
+def subscribe_newsletter():
+    email = request.form.get('email')
+    if not email:
+        flash('Email is required.', 'warning')
+        return redirect(request.referrer or url_for('home'))
+
+    try:
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        # Check if already subscribed
+        c.execute("SELECT * FROM newsletter_subscribers WHERE email = ?", (email,))
+        if c.fetchone():
+            flash('You are already subscribed to our newsletter!', 'info')
+        else:
+            subscribed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            c.execute("INSERT INTO newsletter_subscribers (email, subscribed_at) VALUES (?, ?)", (email, subscribed_at))
+            conn.commit()
+            flash('Thank you for subscribing to our newsletter!', 'success')
+        conn.close()
+    except Exception:
+        flash('An error occurred while subscribing.', 'danger')
+
+    return redirect(request.referrer or url_for('home'))
+
+@app.route('/admin/contacts')
+@admin_required
+def admin_contacts():
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    # Select columns including reply info if present
+    try:
+        c.execute("PRAGMA table_info('contacts')")
+        cols = [r[1] for r in c.fetchall()]
+        if 'admin_reply' in cols:
+            c.execute("SELECT id, name, email, message, date, admin_reply, replied_at, replied_by FROM contacts ORDER BY date DESC")
+        else:
+            c.execute("SELECT id, name, email, message, date, NULL, NULL, NULL FROM contacts ORDER BY date DESC")
+        contacts = c.fetchall()
+    except Exception:
+        contacts = []
+    conn.close()
+    return render_template('admin_contacts.html', contacts=contacts)
+
+
+@app.route('/admin/reply_contact/<int:contact_id>', methods=['POST'])
+@admin_required
+def admin_reply_contact(contact_id):
+    reply = request.form.get('reply')
+    if not reply:
+        flash('Reply cannot be empty.', 'warning')
+        return redirect(request.referrer or url_for('admin_contacts'))
+
+    try:
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        # Update contact with reply, replied_at and replied_by
+        replied_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        admin_user = session.get('admin_user') or session.get('user_id') or 'admin'
+        c.execute("UPDATE contacts SET admin_reply = ?, replied_at = ?, replied_by = ? WHERE id = ?",
+                  (reply, replied_at, admin_user, contact_id))
+        conn.commit()
+        # Optionally send email to user (best-effort)
+        try:
+            c.execute("SELECT email FROM contacts WHERE id = ?", (contact_id,))
+            row = c.fetchone()
+            if row and app.config.get('SMTP_HOST') and app.config.get('ADMIN_NOTIFICATION_EMAIL'):
+                to_email = row[0]
+                subject = 'Reply to your message on Dream Baby Care'
+                body = f"Dear user,\n\nAn admin has replied to your message:\n\n{reply}\n\n--\nDream Baby Care"
+                send_admin_notification(subject, body)
+        except Exception:
+            pass
+        conn.close()
+        flash('Reply saved and user notified (if SMTP configured).', 'success')
+    except Exception:
+        flash('Failed to save reply.', 'danger')
+
+    return redirect(request.referrer or url_for('admin_contacts'))
+
+@app.route('/admin/doctors')
+@admin_required
+def admin_doctors():
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM doctors")
+    doctors = c.fetchall()
+    conn.close()
+    return render_template('admin_doctors.html', doctors=doctors)
+
+@app.route('/admin/doctor/add', methods=['POST'])
+@admin_required
+def admin_add_doctor():
+    name = request.form.get('name')
+    spec = request.form.get('specialization')
+    email = request.form.get('email')
+    password = request.form.get('password')
+    image = request.form.get('image')
+    phone = request.form.get('phone')
+    video = request.form.get('video_link')
+
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO doctors (name, specialization, email, password, image, phone, video_link) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              (name, spec, email, password, image, phone, video))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('admin_doctors'))
+
+@app.route('/admin/doctor/delete/<int:doctor_id>', methods=['POST'])
+@admin_required
+def admin_delete_doctor(doctor_id):
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM doctors WHERE id = ?", (doctor_id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('admin_doctors'))
+
+@app.route('/admin/appointments')
+@admin_required
+def admin_appointments():
+    status_filter = request.args.get('status')
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    
+    query = """
+        SELECT a.id, u.parent_name, u.email, d.name, a.appointment_time, a.type, a.status, a.created_at
+        FROM appointments a
+        LEFT JOIN users u ON a.user_id = u.email
+        LEFT JOIN doctors d ON a.doctor_id = d.id
+    """
+    params = []
+    if status_filter and status_filter != 'All':
+        query += " WHERE a.status = ?"
+        params.append(status_filter)
+    
+    query += " ORDER BY a.appointment_time DESC"
+    
+    c.execute(query, tuple(params))
+    appointments = c.fetchall()
+    conn.close()
+    return render_template('admin_appointments.html', appointments=appointments, current_status=status_filter)
+
+@app.route('/admin/appointment/status/<int:appt_id>', methods=['POST'])
+@admin_required
+def admin_update_appointment_status(appt_id):
+    status = request.form.get('status')
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("UPDATE appointments SET status = ? WHERE id = ?", (status, appt_id))
+    conn.commit()
+    conn.close()
+    flash(f'Appointment status updated to {status}', 'success')
+    return redirect(url_for('admin_appointments'))
+
+# ===== DOCTOR AUTH & DASHBOARD =====
+
+@app.route('/doctor/login', methods=['GET', 'POST'])
+def doctor_login():
+    error = None
+    if request.method == 'POST':
+        email = request.form.get('email')
+        password = request.form.get('password')
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        c.execute("SELECT * FROM doctors WHERE email = ? AND password = ?", (email, password))
+        doctor = c.fetchone()
+        conn.close()
+        if doctor:
+            session['doctor_id'] = doctor[0]
+            session['doctor_name'] = doctor[1]
+            return redirect(url_for('doctor_dashboard'))
+        else:
+            error = 'Invalid doctor credentials. Please try again.'
+    return render_template('doctor_login.html', error=error)
+
+@app.route('/doctor/dashboard')
+@doctor_required
+def doctor_dashboard():
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+
+    # Fetch doctor's details
+    c.execute("SELECT name, specialization FROM doctors WHERE id = ?", (session['doctor_id'],))
+    doctor_details = c.fetchone()
+
+    # Fetch upcoming appointments for the logged-in doctor
+    c.execute("""
+        SELECT a.id, u.parent_name, u.email, a.appointment_time, a.type, a.status, u.phone
+        FROM appointments a
+        JOIN users u ON a.user_id = u.email
+        WHERE a.doctor_id = ? AND a.status IN ('Confirmed', 'Pending')
+        ORDER BY a.appointment_time ASC
+    """, (session['doctor_id'],))
+    appointments = c.fetchall()
+    conn.close()
+
+    # Calculate stats
+    stats = {
+        'total_upcoming': len(appointments),
+        'pending': len([appt for appt in appointments if appt[5] == 'Pending']),
+        'confirmed': len([appt for appt in appointments if appt[5] == 'Confirmed'])
+    }
+
+    return render_template('doctor_dashboard.html', appointments=appointments, doctor=doctor_details, stats=stats)
+
+@app.route('/doctor/logout')
+def doctor_logout():
+    session.pop('doctor_id', None)
+    session.pop('doctor_name', None)
+    return redirect(url_for('doctor_login'))
+
+@app.route('/doctor/appointment/status/<int:appt_id>', methods=['POST'])
+@doctor_required
+def doctor_update_appointment_status(appt_id):
+    status = request.form.get('status')
+    notes = request.form.get('notes')
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    
+    if status == 'Completed' and notes:
+        c.execute("UPDATE appointments SET status = ?, notes = ? WHERE id = ? AND doctor_id = ?", (status, notes, appt_id, session['doctor_id']))
+    else:
+        c.execute("UPDATE appointments SET status = ? WHERE id = ? AND doctor_id = ?", (status, appt_id, session['doctor_id']))
+    conn.commit()
+    conn.close()
+    flash(f'Appointment marked as {status}', 'success')
+    return redirect(url_for('doctor_dashboard'))
+
+# Admin Login
+@app.route('/admin/login', methods=['GET', 'POST'])
+def admin_login():
+    error = None
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        if username == app.config.get('ADMIN_USER') and password == app.config.get('ADMIN_PASS'):
+            session['admin_logged_in'] = True
+            session['admin_user'] = username
+            return redirect(url_for('admin_dashboard'))
+        else:
+            error = 'Invalid admin credentials'
+    return render_template('admin_login.html', error=error)
+
+
+# Admin logout
+@app.route('/admin/logout')
+def admin_logout():
+    session.pop('admin_logged_in', None)
+    session.pop('admin_user', None)
+    return redirect(url_for('admin_login'))
+
+# ===== USER AUTH ROUTES =====
+
+# User Registration Page
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        email = request.form.get('email')
+        password = request.form.get('password')
+        parent_name = request.form.get('parent_name')
+        baby_name = request.form.get('baby_name')
+        baby_dob = request.form.get('baby_dob')
+        phone = request.form.get('phone')
+        address = request.form.get('address')
+        
+        # Calculate baby age from DOB
+        try:
+            dob = datetime.strptime(baby_dob, '%Y-%m-%d')
+            today = datetime.now()
+            age_days = (today - dob).days
+            if age_days < 30:
+                baby_age = f"{age_days} days"
+            elif age_days < 365:
+                baby_age = f"{age_days // 30} months"
+            else:
+                baby_age = f"{age_days // 365} years"
+        except:
+            baby_age = "Unknown"
+        
+        # Check if email already exists
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE email = ?", (email,))
+        if c.fetchone():
+            conn.close()
+            return render_template('register.html', error="Email already registered")
+        
+        # Insert new user
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        language = request.form.get('language', 'en')  # Get language from form (default 'en')
+        c.execute('''INSERT INTO users (email, password, parent_name, baby_name, baby_dob, baby_age, phone, address, created_at, language)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  (email, password, parent_name, baby_name, baby_dob, baby_age, phone, address, created_at, language))
+        conn.commit()
+        conn.close()
+        
+        session['user_id'] = email
+        session['user_name'] = parent_name
+        session['language'] = language  # Set language in session
+        return redirect(url_for('home'))
+    
+    return render_template('register.html')
+
+# User Login Page
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        email = request.form.get('email')
+        password = request.form.get('password')
+        
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE email = ? AND password = ?", (email, password))
+        user = c.fetchone()
+        conn.close()
+
+        if user:
+            session['user_id'] = email
+            session['user_name'] = user[3]
+            # Fetch language and subscription status from DB (safe checks)
+            try:
+                conn2 = sqlite3.connect('babycare.db')
+                c2 = conn2.cursor()
+                c2.execute("PRAGMA table_info('users')")
+                cols = [r[1] for r in c2.fetchall()]
+                # language
+                if 'language' in cols:
+                    c2.execute("SELECT language FROM users WHERE email = ?", (email,))
+                    res = c2.fetchone()
+                    session['language'] = res[0] if res and res[0] else 'en'
+                else:
+                    session['language'] = 'en'
+                # is_admin
+                if 'is_admin' in cols:
+                    c2.execute("SELECT is_admin FROM users WHERE email = ?", (email,))
+                    res_admin = c2.fetchone()
+                    session['is_admin'] = 1 if res_admin and res_admin[0] else 0
+                else:
+                    session['is_admin'] = 0
+                # is_subscribed
+                if 'is_subscribed' in cols:
+                    c2.execute("SELECT is_subscribed FROM users WHERE email = ?", (email,))
+                    res2 = c2.fetchone()
+                    session['is_subscribed'] = 1 if res2 and res2[0] else 0
+                else:
+                    session['is_subscribed'] = 0
+                # subscription_pending
+                if 'subscription_pending' in cols:
+                    c2.execute("SELECT subscription_pending FROM users WHERE email = ?", (email,))
+                    res3 = c2.fetchone()
+                    session['subscription_pending'] = 1 if res3 and res3[0] else 0
+                else:
+                    session['subscription_pending'] = 0
+                conn2.close()
+            except Exception:
+                session['language'] = 'en'
+                session['is_subscribed'] = 0
+
+            return redirect(url_for('home'))
+        else:
+            return render_template('login.html', error="Invalid email or password")
+    
+    return render_template('login.html')
+
+# User Dashboard
+@app.route('/user/dashboard')
+@login_required
+def user_dashboard():
+    
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE email = ?", (session['user_id'],))
+    user = c.fetchone()
+    
+    # Fetch recent tracking data
+    c.execute("""SELECT * FROM baby_tracker WHERE user_id = ? ORDER BY created_at DESC LIMIT 10""", 
+              (session['user_id'],))
+    tracking_data = c.fetchall()
+
+    # Fetch user contact messages and any admin replies
+    try:
+        c.execute("PRAGMA table_info('contacts')")
+        contact_cols = [r[1] for r in c.fetchall()]
+        if 'admin_reply' in contact_cols:
+            c.execute("SELECT id, name, email, message, date, admin_reply, replied_at, replied_by FROM contacts WHERE email = ? ORDER BY date DESC", (session['user_id'],))
+        else:
+            c.execute("SELECT id, name, email, message, date, NULL, NULL, NULL FROM contacts WHERE email = ? ORDER BY date DESC", (session['user_id'],))
+        user_contacts = c.fetchall()
+    except Exception:
+        user_contacts = []
+    
+    # Fetch appointments
+    try:
+        c.execute("""
+            SELECT a.id, d.name, a.appointment_time, a.type, a.status, d.video_link, a.notes
+            FROM appointments a
+            JOIN doctors d ON a.doctor_id = d.id
+            WHERE a.user_id = ?
+            ORDER BY a.appointment_time DESC
+        """, (session['user_id'],))
+        appointments = c.fetchall()
+    except Exception:
+        appointments = []
+
+    conn.close()
+    
+    if user:
+        user_data = {
+            'id': user[0],
+            'email': user[1],
+            'parent_name': user[3],
+            'baby_name': user[4],
+            'baby_dob': user[5],
+            'baby_age': user[6],
+            'phone': user[7],
+            'address': user[8],
+            'created_at': user[9]
+        }
+        # pass subscription flags explicitly
+        is_sub = session.get('is_subscribed', 0)
+        sub_pending = session.get('subscription_pending', 0)
+        return render_template('user_dashboard.html', user=user_data, tracking_data=tracking_data,
+                       is_subscribed=is_sub, subscription_pending=sub_pending, user_contacts=user_contacts, appointments=appointments)
+    
+    return redirect(url_for('login'))
+
+# User Logout
+@app.route('/user/logout')
+def user_logout():
+    session.clear()
+    return redirect(url_for('landing'))
+
+# ===== BABY TRACKER =====
+
+# Add tracking event
+@app.route('/tracker/add', methods=['POST'])
+@login_required
+def add_tracker():
+    activity_type = request.form.get('activity_type')
+    notes = request.form.get('notes', '')
+    
+    if not activity_type:
+        return jsonify({'error': 'Activity type is required'}), 400
+    
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    
+    start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    c.execute("""INSERT INTO baby_tracker (user_id, activity_type, start_time, created_at, notes)
+                 VALUES (?, ?, ?, ?, ?)""",
+              (session['user_id'], activity_type, start_time, created_at, notes))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': f'{activity_type} started!'}), 201
+
+# End tracking event
+@app.route('/tracker/end/<int:tracker_id>', methods=['POST'])
+@login_required
+def end_tracker(tracker_id):
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    
+    # Verify ownership
+    c.execute("SELECT * FROM baby_tracker WHERE id = ? AND user_id = ?", (tracker_id, session['user_id']))
+    tracker = c.fetchone()
+    
+    if not tracker:
+        conn.close()
+        return jsonify({'error': 'Tracker not found'}), 404
+    
+    end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("UPDATE baby_tracker SET end_time = ? WHERE id = ?", (end_time, tracker_id))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': f'{tracker[2]} ended!'}), 200
+
+# Delete tracker entry
+@app.route('/tracker/delete/<int:tracker_id>', methods=['POST'])
+@login_required
+def delete_tracker(tracker_id):
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    
+    # Verify ownership
+    c.execute("SELECT * FROM baby_tracker WHERE id = ? AND user_id = ?", (tracker_id, session['user_id']))
+    tracker = c.fetchone()
+    
+    if not tracker:
+        conn.close()
+        return jsonify({'error': 'Tracker not found'}), 404
+    
+    c.execute("DELETE FROM baby_tracker WHERE id = ?", (tracker_id,))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'message': 'Entry deleted!'}), 200
+
+# ===== ADMIN PANEL =====
+
+# Reminder Routes
+@app.route('/tracker/reminder/add', methods=['POST'])
+@login_required
+def add_reminder():
+    message = request.form.get('message')
+    remind_time = request.form.get('remind_time')
+    
+    if not message or not remind_time:
+        return jsonify({'error': 'Message and time are required'}), 400
+
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO reminders (user_id, message, remind_time, created_at) VALUES (?, ?, ?, ?)",
+              (session['user_id'], message, remind_time, created_at))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'message': 'Reminder set!'})
+
+@app.route('/tracker/reminder/delete/<int:reminder_id>', methods=['POST'])
+@login_required
+def delete_reminder(reminder_id):
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM reminders WHERE id = ? AND user_id = ?", (reminder_id, session['user_id']))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'message': 'Reminder deleted!'})
+
+# Tracker page (separate full page)
+@app.route('/tracker')
+@login_required
+def tracker_page():
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    
+    # Optional date filtering
+    date_filter = request.args.get('date')
+    if date_filter:
+        c.execute("SELECT * FROM baby_tracker WHERE user_id = ? AND start_time LIKE ? ORDER BY created_at DESC", 
+                 (session['user_id'], f"{date_filter}%"))
+    else:
+        c.execute("SELECT * FROM baby_tracker WHERE user_id = ? ORDER BY created_at DESC", (session['user_id'],))
+        
+    raw_data = c.fetchall()
+
+    # Fetch reminders
+    c.execute("SELECT * FROM reminders WHERE user_id = ? ORDER BY remind_time ASC", (session['user_id'],))
+    reminders = c.fetchall()
+    conn.close()
+    
+    # Process data for statistics and better display
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    display_date = date_filter if date_filter else today_str
+    
+    stats = {
+        'sleep_duration': 0,
+        'feed_count': 0,
+        'diaper_count': 0
+    }
+    
+    formatted_activities = []
+    icons = {
+        'Feeding': 'fas fa-baby-bottle',
+        'Sleep': 'fas fa-moon',
+        'Diaper': 'fas fa-baby',
+        'Health': 'fas fa-heartbeat',
+        'Bath': 'fas fa-bath'
+    }
+    
+    for row in raw_data:
+        # row: id(0), user_id(1), activity_type(2), start_time(3), end_time(4), notes(5), created_at(6)
+        try:
+            start_dt = datetime.strptime(row[3], "%Y-%m-%d %H:%M:%S")
+            end_dt = datetime.strptime(row[4], "%Y-%m-%d %H:%M:%S") if row[4] else None
+            
+            duration_str = ""
+            if end_dt:
+                diff = end_dt - start_dt
+                total_seconds = diff.total_seconds()
+                hours = int(total_seconds // 3600)
+                minutes = int((total_seconds % 3600) // 60)
+                duration_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+                
+                if start_dt.strftime("%Y-%m-%d") == display_date and row[2] == 'Sleep':
+                    stats['sleep_duration'] += total_seconds
+            
+            if start_dt.strftime("%Y-%m-%d") == display_date:
+                if row[2] == 'Feeding': stats['feed_count'] += 1
+                elif row[2] == 'Diaper': stats['diaper_count'] += 1
+
+            formatted_activities.append({
+                'id': row[0],
+                'type': row[2],
+                'start_time': start_dt.strftime("%I:%M %p"),
+                'date': start_dt.strftime("%b %d"),
+                'end_time': end_dt.strftime("%I:%M %p") if end_dt else None,
+                'duration': duration_str,
+                'notes': row[5],
+                'icon': icons.get(row[2], 'fas fa-circle'),
+                'is_active': row[4] is None and row[2] == 'Sleep'
+            })
+        except Exception:
+            continue
+
+    # Format sleep duration
+    sleep_hours = int(stats['sleep_duration'] // 3600)
+    sleep_minutes = int((stats['sleep_duration'] % 3600) // 60)
+    stats['sleep_display'] = f"{sleep_hours}h {sleep_minutes}m"
+
+    return render_template('tracker.html', 
+                         tracking_data=raw_data, 
+                         activities=formatted_activities, 
+                         stats=stats,
+                         current_date=display_date,
+                         reminders=reminders)
+
+
+# API to check subscription status for current user (used by client polling)
+@app.route('/subscription_status')
+@login_required
+def subscription_status():
+    try:
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        c.execute("PRAGMA table_info('users')")
+        cols = [r[1] for r in c.fetchall()]
+        is_subscribed = 0
+        subscription_pending = 0
+        if 'is_subscribed' in cols:
+            c.execute("SELECT is_subscribed FROM users WHERE email = ?", (session['user_id'],))
+            r = c.fetchone()
+            is_subscribed = 1 if r and r[0] else 0
+        if 'subscription_pending' in cols:
+            c.execute("SELECT subscription_pending FROM users WHERE email = ?", (session['user_id'],))
+            r2 = c.fetchone()
+            subscription_pending = 1 if r2 and r2[0] else 0
+        conn.close()
+        # keep session in sync
+        session['is_subscribed'] = is_subscribed
+        session['subscription_pending'] = subscription_pending
+        return jsonify({'is_subscribed': is_subscribed, 'subscription_pending': subscription_pending})
+    except Exception:
+        return jsonify({'error': 'Unable to determine status'}), 500
+
+
+# Subscribe page (simulated)
+@app.route('/subscribe', methods=['GET', 'POST'])
+@login_required
+def subscribe():
+    # Show UPI QR / instructions. When user POSTs, mark subscription as pending for admin approval.
+    if request.method == 'POST':
+        # Ensure user is logged in (login_required decorator handles this)
+        try:
+            conn = sqlite3.connect('babycare.db')
+            c = conn.cursor()
+            # Mark subscription request as pending; admin will approve manually
+            c.execute("UPDATE users SET subscription_pending = 1 WHERE email = ?", (session['user_id'],))
+            conn.commit()
+            conn.close()
+            session['subscription_pending'] = 1
+        except Exception:
+            pass
+        # Send admin notification (best-effort)
+        try:
+            subject = f"Subscription request: {session.get('user_id')}"
+            # Send admin to the comprehensive admin panel
+            body = f"User {session.get('user_id')} has requested subscription access. Please verify payment and approve in the admin panel: {request.url_root}admin/manage_subscriptions"
+            send_admin_notification(subject, body)
+        except Exception:
+            pass
+
+        return redirect(url_for('user_dashboard'))
+
+    # GET: render subscribe instructions and QR
+    return render_template('subscribe.html', price=99)
+
+# Admin Dashboard - View all users
+@app.route('/admin/dashboard')
+@admin_required
+def admin_dashboard():
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    
+    # Get all users
+    c.execute("SELECT * FROM users ORDER BY created_at DESC")
+    users = c.fetchall()
+    
+    # Get stats
+    c.execute("SELECT COUNT(*) FROM users")
+    total_users = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM contacts")
+    total_contacts = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM products")
+    total_products = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM cart")
+    total_orders = c.fetchone()[0]
+    
+    # Fetch recent contact messages (last 5)
+    c.execute("SELECT name, email, message, date FROM contacts ORDER BY date DESC LIMIT 5")
+    recent_contacts = c.fetchall()
+
+    conn.close()
+    
+    users_list = []
+    pending_count = 0
+    subscribed_count = 0
+    for user in users:
+        is_sub = 0
+        sub_pending = 0
+        # users table may have these columns added via migration
+        try:
+            # columns: id, email, password, parent_name, baby_name, baby_dob, baby_age, phone, address, created_at, language?, is_admin?, is_subscribed?, subscription_pending?
+            # Safely extract by position if present
+            # try to read by name where possible - fall back to positions
+            is_sub = int(user[10]) if len(user) > 10 and user[10] is not None else 0
+        except Exception:
+            is_sub = 0
+        try:
+            sub_pending = int(user[11]) if len(user) > 11 and user[11] is not None else 0
+        except Exception:
+            sub_pending = 0
+
+        if is_sub:
+            subscribed_count += 1
+        if sub_pending:
+            pending_count += 1
+
+        users_list.append({
+            'id': user[0],
+            'email': user[1],
+            'parent_name': user[3],
+            'baby_name': user[4],
+            'baby_dob': user[5],
+            'baby_age': user[6],
+            'phone': user[7],
+            'address': user[8],
+            'created_at': user[9],
+            'is_subscribed': is_sub,
+            'subscription_pending': sub_pending
+        })
+    
+    stats = {
+        'total_users': total_users,
+        'total_contacts': total_contacts,
+        'total_products': total_products,
+        'total_orders': total_orders
+    }
+    
+    # add counts to stats for convenience
+    stats['pending_requests'] = pending_count
+    stats['subscribed_users'] = subscribed_count
+
+    return render_template('admin_dashboard.html', users=users_list, stats=stats, recent_contacts=recent_contacts)
+
+
+# Admin - Manage users page
+@app.route('/admin/users')
+@admin_required
+def admin_manage_users():
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("SELECT id, email, parent_name, baby_name, baby_dob, baby_age, phone, address, created_at, is_admin FROM users ORDER BY created_at DESC")
+    rows = c.fetchall()
+    conn.close()
+
+    users = []
+    for r in rows:
+        users.append({
+            'id': r[0],
+            'email': r[1],
+            'parent_name': r[2],
+            'baby_name': r[3],
+            'baby_dob': r[4],
+            'baby_age': r[5],
+            'phone': r[6],
+            'address': r[7],
+            'created_at': r[8],
+            'is_admin': int(r[9]) if r[9] is not None else 0
+        })
+
+    return render_template('admin_manage_users.html', users=users)
+
+
+# Promote user to admin
+@app.route('/admin/promote/<int:user_id>', methods=['POST'])
+@admin_required
+def admin_promote_user(user_id):
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('admin_manage_users'))
+
+
+# Demote user from admin
+@app.route('/admin/demote/<int:user_id>', methods=['POST'])
+@admin_required
+def admin_demote_user(user_id):
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    c.execute("UPDATE users SET is_admin = 0 WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('admin_manage_users'))
+
+
+# --- Subscription requests management for admin ---
+@app.route('/admin/subscriptions')
+@admin_required
+def admin_subscriptions():
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    # Fetch users who have a pending subscription request
+    try:
+        c.execute("SELECT id, email, parent_name, created_at FROM users WHERE subscription_pending = 1")
+        requests = c.fetchall()
+    except Exception:
+        requests = []
+    conn.close()
+    return render_template('admin_subscriptions.html', requests=requests)
+
+
+@app.route('/admin/approve_subscription/<int:user_id>', methods=['POST'])
+@admin_required
+def admin_approve_subscription(user_id):
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    # Get current state for logging
+    try:
+        c.execute("SELECT email, is_subscribed, subscription_pending FROM users WHERE id = ?", (user_id,))
+        row = c.fetchone()
+        user_email = row[0] if row else str(user_id)
+        prev_is_sub = int(row[1]) if row and row[1] is not None else 0
+        prev_pending = int(row[2]) if row and row[2] is not None else 0
+    except Exception:
+        user_email = str(user_id)
+        prev_is_sub = 0
+        prev_pending = 0
+
+    # Approve: set is_subscribed=1 and clear pending flag
+    try:
+        new_is_sub = 1
+        new_pending = 0
+        c.execute("UPDATE users SET is_subscribed = ?, subscription_pending = ? WHERE id = ?", (new_is_sub, new_pending, user_id))
+        conn.commit()
+        flash(f"Approved subscription for {user_email}", 'success')
+        try:
+            log_admin_action('approve', user_id, user_email, prev_is_sub, prev_pending, new_is_sub, new_pending)
+        except Exception:
+            pass
+    except Exception:
+        flash(f"Failed to approve subscription for {user_email}", 'danger')
+    finally:
+        conn.close()
+
+    # Redirect back to referring page if possible, else to manage_subscriptions
+    ref = request.referrer
+    return redirect(ref or url_for('admin_manage_subscriptions'))
+
+
+@app.route('/admin/reject_subscription/<int:user_id>', methods=['POST'])
+@admin_required
+def admin_reject_subscription(user_id):
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    try:
+        c.execute("SELECT email, is_subscribed, subscription_pending FROM users WHERE id = ?", (user_id,))
+        row = c.fetchone()
+        user_email = row[0] if row else str(user_id)
+        prev_is_sub = int(row[1]) if row and row[1] is not None else 0
+        prev_pending = int(row[2]) if row and row[2] is not None else 0
+    except Exception:
+        user_email = str(user_id)
+        prev_is_sub = 0
+        prev_pending = 0
+
+    try:
+        new_is_sub = 0
+        new_pending = 0
+        c.execute("UPDATE users SET subscription_pending = ?, is_subscribed = ? WHERE id = ?", (new_pending, new_is_sub, user_id))
+        conn.commit()
+        flash(f"Rejected subscription request for {user_email}", 'warning')
+        try:
+            log_admin_action('reject', user_id, user_email, prev_is_sub, prev_pending, new_is_sub, new_pending)
+        except Exception:
+            pass
+    except Exception:
+        flash(f"Failed to reject subscription for {user_email}", 'danger')
+    finally:
+        conn.close()
+
+    ref = request.referrer
+    return redirect(ref or url_for('admin_manage_subscriptions'))
+
+
+# --- Comprehensive Admin Subscription Management ---
+@app.route('/admin/manage_subscriptions')
+@admin_required
+def admin_manage_subscriptions():
+    """Admin page to manage all user subscriptions: grant, revoke, approve pending requests."""
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    
+    # Pending requests
+    try:
+        c.execute("""SELECT id, email, parent_name, baby_name, created_at 
+                     FROM users WHERE subscription_pending = 1 ORDER BY created_at DESC""")
+        pending_requests = []
+        for row in c.fetchall():
+            pending_requests.append({
+                'id': row[0],
+                'email': row[1],
+                'parent_name': row[2],
+                'baby_name': row[3],
+                'created_at': row[4]
+            })
+    except Exception:
+        pending_requests = []
+    
+    # Subscribed users
+    try:
+        c.execute("""SELECT id, email, parent_name, baby_name, created_at 
+                     FROM users WHERE is_subscribed = 1 ORDER BY created_at DESC""")
+        subscribed_users = []
+        for row in c.fetchall():
+            subscribed_users.append({
+                'id': row[0],
+                'email': row[1],
+                'parent_name': row[2],
+                'baby_name': row[3],
+                'created_at': row[4]
+            })
+    except Exception:
+        subscribed_users = []
+    
+    # All users with subscription status
+    try:
+        c.execute("""SELECT id, email, parent_name, baby_name, is_subscribed, subscription_pending 
+                     FROM users ORDER BY created_at DESC""")
+        all_users = []
+        for row in c.fetchall():
+            all_users.append({
+                'id': row[0],
+                'email': row[1],
+                'parent_name': row[2],
+                'baby_name': row[3],
+                'is_subscribed': int(row[4]) if row[4] else 0,
+                'subscription_pending': int(row[5]) if row[5] else 0
+            })
+    except Exception:
+        all_users = []
+    
+    conn.close()
+    
+    pending_count = len(pending_requests)
+    subscribed_count = len(subscribed_users)
+    
+    return render_template('admin_manage_subscriptions.html',
+                          pending_requests=pending_requests,
+                          subscribed_users=subscribed_users,
+                          all_users=all_users,
+                          pending_count=pending_count,
+                          subscribed_count=subscribed_count)
+
+
+@app.route('/admin/undo_last_action', methods=['POST'])
+@admin_required
+def admin_undo_last_action():
+    last = read_last_admin_action()
+    if not last:
+        flash('No admin actions to undo.', 'info')
+        return redirect(url_for('admin_dashboard'))
+
+    user_id = last.get('user_id')
+    prev_is_sub = int(last.get('prev_is_subscribed', 0))
+    prev_pending = int(last.get('prev_subscription_pending', 0))
+    try:
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        c.execute("UPDATE users SET is_subscribed = ?, subscription_pending = ? WHERE id = ?", (prev_is_sub, prev_pending, user_id))
+        conn.commit()
+        conn.close()
+        flash(f"Reverted last admin action for user ID {user_id}", 'success')
+        # Log the undo as an action referencing the original
+        try:
+            log_admin_action('undo', user_id, last.get('user_email', ''), last.get('new_is_subscribed', 0), last.get('new_subscription_pending', 0), prev_is_sub, prev_pending)
+        except Exception:
+            pass
+    except Exception:
+        flash('Failed to undo last admin action.', 'danger')
+
+    return redirect(url_for('admin_dashboard'))
+
+
+@app.route('/admin/grant_subscription/<int:user_id>', methods=['POST'])
+@admin_required
+def admin_grant_subscription(user_id):
+    """Grant subscription access to a user (manually by admin)."""
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    try:
+        c.execute("SELECT email, is_subscribed, subscription_pending FROM users WHERE id = ?", (user_id,))
+        row = c.fetchone()
+        user_email = row[0] if row else str(user_id)
+        prev_is_sub = int(row[1]) if row and row[1] is not None else 0
+        prev_pending = int(row[2]) if row and row[2] is not None else 0
+    except Exception:
+        user_email = str(user_id)
+        prev_is_sub = 0
+        prev_pending = 0
+
+    try:
+        new_is_sub = 1
+        new_pending = 0
+        c.execute("UPDATE users SET is_subscribed = ?, subscription_pending = ? WHERE id = ?", (new_is_sub, new_pending, user_id))
+        conn.commit()
+        flash(f"Granted subscription access to {user_email}", 'success')
+        try:
+            log_admin_action('grant', user_id, user_email, prev_is_sub, prev_pending, new_is_sub, new_pending)
+        except Exception:
+            pass
+    except Exception:
+        flash(f"Failed to grant subscription to {user_email}", 'danger')
+    finally:
+        conn.close()
+
+    return redirect(url_for('admin_manage_subscriptions'))
+
+
+@app.route('/admin/revoke_subscription/<int:user_id>', methods=['POST'])
+@admin_required
+def admin_revoke_subscription(user_id):
+    """Revoke subscription access from a user."""
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    try:
+        c.execute("SELECT email, is_subscribed, subscription_pending FROM users WHERE id = ?", (user_id,))
+        row = c.fetchone()
+        user_email = row[0] if row else str(user_id)
+        prev_is_sub = int(row[1]) if row and row[1] is not None else 0
+        prev_pending = int(row[2]) if row and row[2] is not None else 0
+    except Exception:
+        user_email = str(user_id)
+        prev_is_sub = 0
+        prev_pending = 0
+
+    try:
+        new_is_sub = 0
+        new_pending = 0
+        c.execute("UPDATE users SET is_subscribed = ?, subscription_pending = ? WHERE id = ?", (new_is_sub, new_pending, user_id))
+        conn.commit()
+        flash(f"Revoked subscription access from {user_email}", 'warning')
+        try:
+            log_admin_action('revoke', user_id, user_email, prev_is_sub, prev_pending, new_is_sub, new_pending)
+        except Exception:
+            pass
+    except Exception:
+        flash(f"Failed to revoke subscription for {user_email}", 'danger')
+    finally:
+        conn.close()
+
+    return redirect(url_for('admin_manage_subscriptions'))
+
+
+# Admin action log viewer
+@app.route('/admin/action_log')
+@admin_required
+def admin_action_log():
+    """Display all admin actions with per-action undo buttons."""
+    all_actions = read_all_admin_actions()
+    # Reverse to show newest first
+    all_actions.reverse()
+    return render_template('admin_action_log.html', actions=all_actions, total_actions=len(all_actions))
+
+
+@app.route('/admin/undo_action/<int:log_index>', methods=['POST'])
+@admin_required
+def admin_undo_action(log_index):
+    """Undo a specific admin action by log index."""
+    all_actions = read_all_admin_actions()
+    if log_index < 0 or log_index >= len(all_actions):
+        flash('Action not found in log.', 'danger')
+        return redirect(url_for('admin_action_log'))
+
+    target = all_actions[log_index]
+    user_id = target.get('user_id')
+    prev_is_sub = int(target.get('prev_is_subscribed', 0))
+    prev_pending = int(target.get('prev_subscription_pending', 0))
+
+    try:
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        c.execute("UPDATE users SET is_subscribed = ?, subscription_pending = ? WHERE id = ?", (prev_is_sub, prev_pending, user_id))
+        conn.commit()
+        conn.close()
+        flash(f"Reverted action on user ID {user_id}: {target.get('action')}", 'success')
+        try:
+            log_admin_action('undo', user_id, target.get('user_email', ''), target.get('new_is_subscribed', 0), target.get('new_subscription_pending', 0), prev_is_sub, prev_pending)
+        except Exception:
+            pass
+    except Exception:
+        flash('Failed to undo action.', 'danger')
+
+    return redirect(url_for('admin_action_log'))
+
+if __name__ == '__main__':
+    init_db()
+    app.run(debug=True)
