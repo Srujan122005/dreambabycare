@@ -115,6 +115,14 @@
         </form>
       </div>
     </div>
+    <!-- Analysis Button / Result -->
+    <div class="d-flex justify-content-end mb-4">
+      <button id="analyzeBtn" class="btn btn-outline-primary me-3">Analyze Day</button>
+    </div>
+    <div id="analysisResult" style="display:none" class="card-modern p-4 mb-4">
+      <h5 class="fw-bold mb-2">AI Analysis</h5>
+      <div id="analysisContent" class="small text-secondary"></div>
+    </div>
 
     <!-- Stats Cards -->
     <div class="row g-4 mb-5">
@@ -417,6 +425,35 @@ document.querySelectorAll('.delete-reminder').forEach(btn => {
     })
     .catch(handleFetchError);
   });
+});
+</script>
+
+<script>
+// Analysis fetcher
+document.getElementById('analyzeBtn').addEventListener('click', function(){
+  const params = new URLSearchParams(window.location.search);
+  const date = params.get('date') || document.querySelector('input[name="date"]').value || '';
+  const url = `/tracker/analyze${date ? '?date=' + encodeURIComponent(date) : ''}`;
+  const resultCard = document.getElementById('analysisResult');
+  const content = document.getElementById('analysisContent');
+  resultCard.style.display = 'block';
+  content.innerHTML = 'Analyzing...';
+
+  fetch(url)
+    .then(res => res.json())
+    .then(d => {
+      if(!d.success){ content.innerHTML = 'Analysis unavailable.'; return; }
+      const analysis = d.analysis || {};
+      const lines = [];
+      if(analysis.insights && analysis.insights.length){
+        analysis.insights.forEach(item => {
+          lines.push(`<strong>${item[0]}:</strong> ${item[1]}`);
+        });
+      }
+      if(analysis.summary) lines.push(`<em>${analysis.summary}</em>`);
+      content.innerHTML = lines.join('<br>');
+    })
+    .catch(err => { content.innerHTML = 'Error fetching analysis'; console.error(err); });
 });
 </script>
 

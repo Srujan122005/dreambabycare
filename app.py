@@ -1310,6 +1310,264 @@ def tracker_page():
                          reminders=reminders)
 
 
+# Simple analyzer for activities to produce health insights
+def analyze_activities_for_health(activities, stats):
+    """Return a concise analysis dict given today's activities and stats.
+    This is a local heuristic analyzer. If an external AI service is desired,
+    you can extend this to call OpenAI (ENV var OPENAI_API_KEY) for richer suggestions.
+    """
+    insights = []
+    score = 0
+
+    # Sleep analysis
+    try:
+        sleep_secs = stats.get('sleep_duration', 0)
+        sleep_hours = sleep_secs / 3600
+        if sleep_hours >= 12:
+            insights.append(('Sleep', 'Great sleep — baby had a long restful period.'))
+            score += 2
+        elif sleep_hours >= 8:
+            insights.append(('Sleep', 'Good amount of sleep for the day.'))
+            score += 1
+        else:
+            insights.append(('Sleep', 'Sleep is low today — consider a calmer pre-sleep routine.'))
+            score -= 1
+    except Exception:
+        pass
+
+    # Feeding analysis
+    feeds = stats.get('feed_count', 0)
+    if feeds >= 8:
+        insights.append(('Feeding', 'Frequent feeds recorded — hydration and growth cues look normal.'))
+        score += 1
+    elif feeds >= 4:
+        insights.append(('Feeding', 'Feeding frequency is within normal range.'))
+    else:
+        insights.append(('Feeding', 'Fewer feeds logged — watch for signs of low intake.'))
+        score -= 1
+
+    # Diaper analysis
+    diapers = stats.get('diaper_count', 0)
+    if diapers >= 6:
+        insights.append(('Diaper', 'Diaper changes are frequent — hydration is likely good.'))
+        score += 1
+    elif diapers >= 3:
+        insights.append(('Diaper', 'Diaper changes are normal.'))
+    else:
+        insights.append(('Diaper', 'Low diaper changes — monitor urine output and consult if worried.'))
+        score -= 1
+
+    # Check for concerning activity notes (fever, high temp, excessive crying)
+    notes_alerts = []
+    crying_count = 0
+    for a in activities:
+        t = (a.get('type') or '').lower()
+        notes = (a.get('notes') or '').lower()
+        if 'cry' in t:
+            crying_count += 1
+        if 'fever' in notes or 'temp' in notes or '°c' in notes or 'c' in notes:
+            notes_alerts.append('Temperature noted in entry — check for fever and consult pediatrician if >38°C.')
+        if 'refuse' in notes or 'not feeding' in notes or 'dehydrat' in notes:
+            notes_alerts.append('Feeding concerns noted — monitor intake closely.')
+
+    if crying_count >= 3:
+        insights.append(('Crying', 'Several crying episodes recorded — could indicate discomfort or colic.'))
+        score -= 1
+
+    for na in notes_alerts:
+        insights.append(('Note', na))
+
+    # Final recommendation based on score
+    if score >= 3:
+        final = 'Overall: Baby looks well today.'
+    elif score >= 0:
+        final = 'Overall: Mostly normal but keep an eye on the few low metrics.'
+    else:
+        final = 'Overall: Some caution advised — monitor symptoms and consider contacting your pediatrician.'
+
+    return {'insights': insights, 'summary': final, 'score': score}
+
+
+# Endpoint to analyze activities for a selected date (returns JSON)
+@app.route('/tracker/analyze', methods=['GET'])
+@login_required
+def tracker_analyze():
+    date_filter = request.args.get('date')
+    conn = sqlite3.connect('babycare.db')
+    c = conn.cursor()
+    try:
+        if date_filter:
+            c.execute("SELECT * FROM baby_tracker WHERE user_id = ? AND start_time LIKE ? ORDER BY created_at DESC",
+                      (session['user_id'], f"{date_filter}%"))
+        else:
+            today = datetime.now().strftime('%Y-%m-%d')
+            c.execute("SELECT * FROM baby_tracker WHERE user_id = ? AND start_time LIKE ? ORDER BY created_at DESC",
+                      (session['user_id'], f"{today}%"))
+        rows = c.fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+
+    # Build activities and stats like tracker_page
+    activities = []
+    stats = {'sleep_duration': 0, 'feed_count': 0, 'diaper_count': 0}
+    for row in rows:
+        try:
+            start_dt = datetime.strptime(row[3], "%Y-%m-%d %H:%M:%S")
+            end_dt = datetime.strptime(row[4], "%Y-%m-%d %H:%M:%S") if row[4] else None
+            if end_dt and row[2] == 'Sleep':
+                stats['sleep_duration'] += (end_dt - start_dt).total_seconds()
+            if row[2] == 'Feeding': stats['feed_count'] += 1
+            if row[2] == 'Diaper': stats['diaper_count'] += 1
+
+            activities.append({'type': row[2], 'start_time': row[3], 'end_time': row[4], 'notes': row[5]})
+        except Exception:
+            continue
+
+    analysis = analyze_activities_for_health(activities, stats)
+    return jsonify({'success': True, 'analysis': analysis})
+
+
+def _user_is_subscribed(user_email):
+    try:
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        c.execute("PRAGMA table_info('users')")
+        cols = [r[1] for r in c.fetchall()]
+        if 'is_subscribed' in cols:
+            c.execute("SELECT is_subscribed FROM users WHERE email = ?", (user_email,))
+            r = c.fetchone()
+            conn.close()
+            return bool(r and int(r[0]) == 1)
+        conn.close()
+    except Exception:
+        pass
+    return False
+
+
+def generate_ai_answer(question, user_email=None, history=None):
+    """Advanced AI Responder.
+    1. Tries Google Gemini API (if GEMINI_API_KEY env var is set)
+    2. Tries OpenAI API (if OPENAI_API_KEY env var is set)
+    3. Falls back to Advanced Local Heuristics (Regex based)
+    """
+    q = (question or '').strip().lower()
+    history = history or []
+    
+    # Build context string for APIs
+    context_str = "You are Dream Baby AI, a helpful, warm, and evidence-based pediatric assistant. Keep answers concise (max 3-4 sentences) and supportive. Always advise seeing a doctor for emergencies.\n\nConversation History:\n"
+    for turn in history[-5:]: # Keep last 5 turns for context
+        context_str += f"User: {turn['user']}\nAI: {turn['ai']}\n"
+    
+    full_prompt = f"{context_str}\nUser: {question}\nAI:"
+
+    # 1. Try Google Gemini
+    try:
+        import google.generativeai as genai
+        gemini_key = os.environ.get('GEMINI_API_KEY')
+        if gemini_key:
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel('gemini-pro')
+            response = model.generate_content(full_prompt)
+            if response.text:
+                return response.text.strip()
+    except Exception:
+        pass
+
+    # 2. Try OpenAI
+    try:
+        import os
+        openai_key = os.environ.get('OPENAI_API_KEY')
+        if openai_key:
+            try:
+                import openai
+                openai.api_key = openai_key
+                messages = [{"role": "system", "content": "You are a helpful pediatric assistant."}]
+                for turn in history[-5:]:
+                    messages.append({"role": "user", "content": turn['user']})
+                    messages.append({"role": "assistant", "content": turn['ai']})
+                messages.append({"role": "user", "content": question})
+                
+                resp = openai.ChatCompletion.create(model='gpt-3.5-turbo', messages=messages, max_tokens=300)
+                text = resp.choices[0].message.content.strip()
+                return text
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3. Advanced Local Heuristics (Regex based fallback)
+    import re
+    patterns = {
+        r'fever|temp|hot|warm': "For babies <3 months, a temp >100.4°F (38°C) is an emergency—call a doctor. For older babies, monitor behavior. If they are playing and drinking, they may just need rest. Keep them hydrated.",
+        r'vomit|puke|throw up': "Spit-up is normal. Projectile vomiting or green/bloody vomit requires a doctor. Keep baby upright after feeds. If vomiting persists, watch for dehydration (dry lips, no tears).",
+        r'sleep|nap|awake|night': "Newborns sleep 14-17h/day. Establish a 'Bath, Book, Bed' routine. Ensure the room is cool and dark. If baby wakes often, check hunger/diaper, but try to let them self-soothe.",
+        r'feed|milk|breast|bottle|hungry': "Newborns feed every 2-3 hours. Look for hunger cues like rooting. 6+ wet diapers/day means they are getting enough. If latching hurts, consult a lactation expert.",
+        r'poop|constipat|diarrhea|stool': "Breastfed poop is yellow/seedy; formula is tan. Hard pellets mean constipation—consult a doctor. Watery diarrhea risks dehydration. Call a doctor if there's blood in stool.",
+        r'cry|colic|fuss|scream': "Check the basics: Hunger, Diaper, Sleep. Try the 5 S's: Swaddle, Side-position, Shush, Swing, Suck. If crying is inconsolable for hours, it might be colic.",
+        r'rash|skin|acne|red': "Baby acne usually clears up alone. For diaper rash, use zinc cream and air time. If a rash doesn't fade when pressed or comes with fever, seek medical help.",
+        r'cough|cold|sneeze|nose': "Saline drops and a bulb syringe help with congestion. A cool-mist humidifier can ease breathing. Watch for rapid breathing or chest retractions—that's urgent.",
+        r'solid|food|eat': "Start solids around 6 months when baby can sit up. Start with single-ingredient purees (sweet potato, avocado) or soft finger foods. Introduce allergens one by one.",
+        r'hello|hi|hey': "Hello! I'm Dream Baby AI. I can help with sleep, feeding, health, and development. What's on your mind?",
+        r'thank': "You're very welcome! You're doing a great job. Let me know if you need anything else."
+    }
+    
+    for pattern, response in patterns.items():
+        if re.search(pattern, q):
+            return response
+
+    return "I can help with general baby care (sleep, feeding, health). Since I'm an AI, for specific medical diagnoses, please see your pediatrician. Could you rephrase your question?"
+
+
+@app.route('/ai')
+@login_required
+def ai_page():
+    # Only allow subscribed users
+    user = session.get('user_id')
+    if not user or not _user_is_subscribed(user):
+        flash('AI Assistant is available to subscribed users only. Please subscribe to access this feature.', 'warning')
+        return redirect(url_for('subscribe'))
+    history = session.get('ai_history', [])
+    return render_template('ai_assistant.html', history=history)
+
+
+@app.route('/ai/ask', methods=['POST'])
+@login_required
+def ai_ask():
+    user = session.get('user_id')
+    if not user or not _user_is_subscribed(user):
+        return jsonify({'success': False, 'error': 'Subscription required'}), 403
+
+    data = request.get_json() or {}
+    question = data.get('question') or data.get('q') or request.form.get('question')
+    if not question:
+        return jsonify({'success': False, 'error': 'Question is required'}), 400
+
+    # Get history
+    history = session.get('ai_history', [])
+
+    try:
+        answer = generate_ai_answer(question, user_email=user, history=history)
+        
+        # Update history
+        history.append({'user': question, 'ai': answer})
+        if len(history) > 20: # Keep last 20 turns
+            history.pop(0)
+        session['ai_history'] = history
+        session.modified = True
+
+        return jsonify({'success': True, 'answer': answer})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/ai/clear', methods=['POST'])
+@login_required
+def ai_clear():
+    session['ai_history'] = []
+    return jsonify({'success': True})
+
+
 # API to check subscription status for current user (used by client polling)
 @app.route('/subscription_status')
 @login_required

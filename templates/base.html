@@ -16,6 +16,54 @@
         .text-purple {
             color: #7c5cbf !important;
         }
+
+        /* --- Animations & Hover Effects --- */
+
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        /* Smooth Page Load */
+        main {
+            animation: fadeInUp 0.6s ease-out;
+        }
+
+        /* Navbar Links Hover */
+        .nav-link {
+            transition: color 0.3s ease, transform 0.3s ease;
+        }
+        .nav-link:hover {
+            transform: translateY(-2px);
+            color: #7c5cbf;
+        }
+
+        /* Button Hover Pop */
+        .btn {
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+        }
+
+        /* Logo Animation */
+        .navbar-brand img {
+            transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+        .navbar-brand:hover img {
+            transform: scale(1.1) rotate(10deg);
+        }
+
+        /* Dropdown Fade In */
+        .dropdown-menu {
+            animation: fadeIn 0.3s ease-out;
+        }
     </style>
 </head>
 <body>
@@ -23,7 +71,7 @@
         <nav class="navbar navbar-expand-lg navbar-light container">
             <a class="navbar-brand fw-bold text-purple d-flex align-items-center" href="{{ url_for('home') }}">
                 <img src="{{ logo }}" alt="Logo" width="30" height="30" class="me-2 rounded-circle shadow-sm">
-                Dream Baby Care
+                <span>Dream Baby Care</span>
             </a>
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#mainNavbar" aria-controls="mainNavbar" aria-expanded="false" aria-label="Toggle navigation">
                 <span class="navbar-toggler-icon"></span>
@@ -42,6 +90,7 @@
                         <li class="nav-item"><a class="nav-link" href="/about">About</a></li>
                         <li class="nav-item"><a class="nav-link" href="/tips">Tips</a></li>
                         <li class="nav-item"><a class="nav-link" href="/tracker">Tracker</a></li>
+                        <li class="nav-item"><a class="nav-link" href="/ai">Baby AI</a></li>
                         <li class="nav-item"><a class="nav-link" href="/shop">Shop</a></li>
                         <li class="nav-item"><a class="nav-link" href="/contact">Contact</a></li>
                         <li class="nav-item ms-2">
@@ -195,7 +244,7 @@
             </div>
             <hr>
             <div class="text-center text-white-50">
-                <p>&copy; 2025 Dream girl cuties - Newborn Baby Care. All rights reserved.</p>
+                <p>&copy; 2025 Dream Baby Care - Newborn Baby Care. All rights reserved.</p>
             </div>
         </div>
     </footer>

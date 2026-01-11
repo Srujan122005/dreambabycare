@@ -9,6 +9,9 @@ translations = {
         'no_videos': 'No videos added for',
         'yet': 'yet. You can add MP4 files to',
         'and_they_will_appear': 'and they will appear here.',
+        'subscribe_required': 'Subscribe to watch',
+        'premium_banner': 'Premium videos: To watch all expert video guides, please subscribe for just ₹99/month',
+        'subscribe_button': 'Subscribe ₹99',
         'tips': {
             'feeding': {
                 'title': 'Feeding Your Newborn',
@@ -39,6 +42,9 @@ translations = {
         'no_videos': 'के लिए कोई वीडियो नहीं जोड़ा गया',
         'yet': 'अभी। आप MP4 फ़ाइलें जोड़ सकते हैं',
         'and_they_will_appear': 'और वे यहाँ दिखाई देंगी।',
+        'subscribe_required': 'देखने के लिए सब्सक्राइब करें',
+        'premium_banner': 'प्रीमियम वीडियो: सभी विशेषज्ञ वीडियो गाइड देखने के लिए, कृपया बस ₹99/माह में सब्सक्राइब करें',
+        'subscribe_button': 'सब्सक्राइब ₹99',
         'tips': {
             'feeding': {
                 'title': 'अपने नवजात शिशु को खिलाना',
@@ -69,6 +75,9 @@ translations = {
         'no_videos': 'ಗೆ ಯಾವುದೇ ವಿಡಿಯೋ ಸೇರಿಸಲಾಗಿಲ್ಲ',
         'yet': 'ಇನ್ನೂ. ನೀವು MP4 ಫೈಲ್‌ಗಳನ್ನು ಸೇರಿಸಬಹುದು',
         'and_they_will_appear': 'ಮತ್ತು ಅವು ಇಲ್ಲಿ ಕಾಣಿಸಿಕೊಳ್ಳುತ್ತವೆ.',
+        'subscribe_required': 'ವೀಕ್ಷಿಸಲು ಚಂದಾದಾರರಾಗಿ',
+        'premium_banner': 'ಪ್ರೀಮಿಯಂ ವೀಡಿಯೊಗಳು: ಎಲ್ಲಾ ತಜ್ಞ ವೀಡಿಯೊ ಮಾರ್ಗದರ್ಶಿಗಳನ್ನು ವೀಕ್ಷಿಸಲು, ದಯವಿಟ್ಟು ತಿಂಗಳಿಗೆ ₹99 ಕ್ಕೆ ಚಂದಾದಾರರಾಗಿ',
+        'subscribe_button': 'ಚಂದಾದಾರರಾಗಿ ₹99',
         'tips': {
             'feeding': {
                 'title': 'ನಿಮ್ಮ ನವಜಾತ ಶಿಶುವನ್ನು ಆಹಾರ ನೀಡುವುದು',
@@ -99,6 +108,9 @@ translations = {
         'no_videos': 'க்கான வீடியோ சேர்க்கப்படவில்லை',
         'yet': 'இன்னும். நீங்கள் MP4 கோப்புகளைச் சேர்க்கலாம்',
         'and_they_will_appear': 'மற்றும் அவை இங்கே தோன்றும்.',
+        'subscribe_required': 'பார்க்க சந்தா செலுத்துங்கள்',
+        'premium_banner': 'பிரீமியம் வீடியோக்கள்: அனைத்து நிபுணர் வீடியோ வழிகாட்டிகளையும் பார்க்க, மாதம் ₹99க்கு சந்தா செலுத்துங்கள்',
+        'subscribe_button': 'சந்தா ₹99',
         'tips': {
             'feeding': {
                 'title': 'உங்கள் பிறந்த குழந்தைக்கு தாய் பாலுண்ணை',
@@ -129,6 +141,9 @@ translations = {
         'no_videos': 'కోసం వీడియోలు జోడించబడలేదు',
         'yet': 'ఇంకా. MP4 ఫైళ్లను జోడించవచ్చు',
         'and_they_will_appear': 'మరియు అవి ఇక్కడ కనిపిస్తాయి.',
+        'subscribe_required': 'చూడటానికి సబ్స్క్రయిబ్ చేయండి',
+        'premium_banner': 'ప్రీమియం వీడియోలు: అన్ని నిపుణుల వీడియో గైడ్‌లను చూడటానికి, దయచేసి నెలకు ₹99తో సబ్స్క్రయిబ్ చేయండి',
+        'subscribe_button': 'సబ్స్క్రయిబ్ ₹99',
         'tips': {
             'feeding': {
                 'title': 'మీ నవజాత శిశువుకు పోషణ ఇవ్వడం',
@@ -159,6 +174,9 @@ translations = {
         'no_videos': 'साठी कोणतेही व्हिडिओ जोडलेले नाहीत',
         'yet': 'अजून. आप MP4 फाइलें जोड़ सकते हैं',
         'and_they_will_appear': 'आणि ते येथे दिसतील.',
+        'subscribe_required': 'पाहण्यासाठी सबस्क्राईब करा',
+        'premium_banner': 'प्रीमियम व्हिडिओ: सर्व तज्ञ व्हिडिओ मार्गदर्शक पाहण्यासाठी, कृपया फक्त ₹99/महिना सबस्क्राईब करा',
+        'subscribe_button': 'सबस्क्राईब ₹99',
         'tips': {
             'feeding': {
                 'title': 'आपल्या नवजात बाळाला खाना देणे',
@@ -189,6 +207,9 @@ translations = {
         'no_videos': 'માટે કોઈ વીડિયો ઉમેરાયું નથી',
         'yet': 'હજુ. તમે MP4 ફાઈલો ઉમેરી શકો છો',
         'and_they_will_appear': 'અને તે અહીં દેખાશે.',
+        'subscribe_required': 'જોવા માટે સબ્સ્ક્રાઇબ કરો',
+        'premium_banner': 'પ્રીમિયમ વિડિઓઝ: તમામ નિષ્ણાત વિડિઓ માર્ગદર્શિકાઓ જોવા માટે, કૃપા કરીને માત્ર ₹99/મહિને સબ્સ્ક્રાઇબ કરો',
+        'subscribe_button': 'સબ્સ્ક્રાઇબ ₹99',
         'tips': {
             'feeding': {
                 'title': 'તમારા નવજાત બાળકને ખવડાવવું',
@@ -219,6 +240,9 @@ translations = {
         'no_videos': 'এর জন্য কোনও ভিডিও যোগ করা হয়নি',
         'yet': 'এখনও। আপনি MP4 ফাইল যোগ করতে পারেন',
         'and_they_will_appear': 'এবং তারা এখানে উপস্থিত হবে।',
+        'subscribe_required': 'দেখতে সাবস্ক্রাইব করুন',
+        'premium_banner': 'প্রিমিয়াম ভিডিও: সমস্ত বিশেষজ্ঞ ভিডিও গাইড দেখতে, অনুগ্রহ করে মাসে মাত্র ₹99 টাকায় সাবস্ক্রাইব করুন',
+        'subscribe_button': 'সাবস্ক্রাইব ₹99',
         'tips': {
             'feeding': {
                 'title': 'আপনার নবজাত শিশুকে খাওয়ানো',
@@ -243,4 +267,3 @@ translations = {
         }
     }
 }
-
