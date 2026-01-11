@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash, send_from_directory, abort
 from functools import wraps
 import sqlite3
 from datetime import datetime, timedelta
@@ -321,7 +321,7 @@ def inject_language():
                 conn.close()
 
     # Inject logo URL globally (ensure you have a file at static/images/Dream_Baby_Care_Logo (1).jpg)
-    logo = url_for('static', filename='images/Dream_Baby_Care_Logo (1).jpg')
+    logo = 'https://res.cloudinary.com/duucdndfx/image/upload/v1767200335/WhatsApp_Image_2025-11-23_at_10.59.52_PM_nwqgbo.jpg'
 
     return dict(lang=lang, lang_data=translations.get(lang, {}), cart_count=cart_count, logo=logo)
 
@@ -495,7 +495,8 @@ def tips():
         if os.path.isdir(folder):
             for fname in sorted(os.listdir(folder)):
                 if fname.lower().endswith(('.mp4', '.webm', '.ogg')):
-                    url = url_for('static', filename=f'videos/{slug}/{fname}')
+                    # Serve videos via protected endpoint to enforce subscription checks
+                    url = url_for('protected_video', filename=f'videos/{slug}/{fname}')
                     video_list.append({'filename': fname, 'url': url})
         videos_by_category[cat] = video_list
 
@@ -1335,6 +1336,34 @@ def subscription_status():
         return jsonify({'is_subscribed': is_subscribed, 'subscription_pending': subscription_pending})
     except Exception:
         return jsonify({'error': 'Unable to determine status'}), 500
+
+
+# Protected video endpoint: checks subscription before serving files from static/videos
+@app.route('/protected_video/<path:filename>')
+@login_required
+def protected_video(filename):
+    # only serve files under the videos/ folder
+    if not filename.startswith('videos/'):
+        return abort(404)
+
+    file_path = os.path.join(app.root_path, 'static', filename)
+    if not os.path.isfile(file_path):
+        return abort(404)
+
+    try:
+        conn = sqlite3.connect('babycare.db')
+        c = conn.cursor()
+        c.execute("SELECT is_subscribed FROM users WHERE email = ?", (session['user_id'],))
+        row = c.fetchone()
+        conn.close()
+        if not row or int(row[0]) != 1:
+            flash('You must be subscribed to access this content.', 'warning')
+            return redirect(url_for('subscribe'))
+    except Exception:
+        return abort(500)
+
+    directory = os.path.join(app.root_path, 'static')
+    return send_from_directory(directory, filename)
 
 
 # Subscribe page (simulated)
